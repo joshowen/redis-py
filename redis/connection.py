@@ -16,7 +16,8 @@ except ImportError:
 
 from redis._compat import (b, xrange, imap, byte_to_chr, unicode, bytes, long,
                            BytesIO, nativestr, basestring, iteritems,
-                           LifoQueue, Empty, Full, urlparse, parse_qs)
+                           LifoQueue, Empty, Full, urlparse, parse_qs,
+                           unquote)
 from redis.exceptions import (
     RedisError,
     ConnectionError,
@@ -79,7 +80,9 @@ class Token(object):
 
 class BaseParser(object):
     EXCEPTION_CLASSES = {
-        'ERR': ResponseError,
+        'ERR': {
+            'max number of clients reached': ConnectionError
+        },
         'EXECABORT': ExecAbortError,
         'LOADING': BusyLoadingError,
         'NOSCRIPT': NoScriptError,
@@ -91,7 +94,10 @@ class BaseParser(object):
         error_code = response.split(' ')[0]
         if error_code in self.EXCEPTION_CLASSES:
             response = response[len(error_code) + 1:]
-            return self.EXCEPTION_CLASSES[error_code](response)
+            exception_class = self.EXCEPTION_CLASSES[error_code]
+            if isinstance(exception_class, dict):
+                exception_class = exception_class.get(response, ResponseError)
+            return exception_class(response)
         return ResponseError(response)
 
 
@@ -179,8 +185,16 @@ class SocketBuffer(object):
         self.bytes_read = 0
 
     def close(self):
-        self.purge()
-        self._buffer.close()
+        try:
+            self.purge()
+            self._buffer.close()
+        except:
+            # issue #633 suggests the purge/close somehow raised a
+            # BadFileDescriptor error. Perhaps the client ran out of
+            # memory or something else? It's probably OK to ignore
+            # any error being raised from purge/close since we're
+            # removing the reference to the instance below.
+            pass
         self._buffer = None
         self._sock = None
 
@@ -345,14 +359,6 @@ class HiredisParser(BaseParser):
                 self._reader.feed(self._buffer, 0, bufflen)
             else:
                 self._reader.feed(buffer)
-            # proactively, but not conclusively, check if more data is in the
-            # buffer. if the data received doesn't end with \r\n, there's more.
-            if HIREDIS_USE_BYTE_BUFFER:
-                if bufflen > 2 and self._buffer[bufflen - 2:bufflen] != SYM_CRLF:
-                    continue
-            else:
-                if not buffer.endswith(SYM_CRLF):
-                    continue
             response = self._reader.gets()
         # if an older version of hiredis is installed, we need to attempt
         # to convert ResponseErrors to their appropriate types.
@@ -431,6 +437,8 @@ class Connection(object):
             return
         try:
             sock = self._connect()
+        except socket.timeout:
+            raise TimeoutError("Timeout connecting to server")
         except socket.error:
             e = sys.exc_info()[1]
             raise ConnectionError(self._error_message(e))
@@ -542,11 +550,12 @@ class Connection(object):
             e = sys.exc_info()[1]
             self.disconnect()
             if len(e.args) == 1:
-                _errno, errmsg = 'UNKNOWN', e.args[0]
+                errno, errmsg = 'UNKNOWN', e.args[0]
             else:
-                _errno, errmsg = e.args
+                errno = e.args[0]
+                errmsg = e.args[1]
             raise ConnectionError("Error %s while writing to socket. %s." %
-                                  (_errno, errmsg))
+                                  (errno, errmsg))
         except:
             self.disconnect()
             raise
@@ -555,13 +564,14 @@ class Connection(object):
         "Pack and send a command to the Redis server"
         self.send_packed_command(self.pack_command(*args))
 
-    def can_read(self):
+    def can_read(self, timeout=0):
         "Poll the socket to see if there's data that can be read."
         sock = self._sock
         if not sock:
             self.connect()
             sock = self._sock
-        return bool(select([sock], [], [], 0)[0]) or self._parser.can_read()
+        return self._parser.can_read() or \
+            bool(select([sock], [], [], timeout)[0])
 
     def read_response(self):
         "Read the response from a previously sent command"
@@ -585,7 +595,7 @@ class Connection(object):
         elif isinstance(value, float):
             value = b(repr(value))
         elif not isinstance(value, basestring):
-            value = str(value)
+            value = unicode(value)
         if isinstance(value, unicode):
             value = value.encode(self.encoding, self.encoding_errors)
         return value
@@ -725,10 +735,29 @@ class UnixDomainSocketConnection(Connection):
                 (exception.args[0], self.path, exception.args[1])
 
 
+FALSE_STRINGS = ('0', 'F', 'FALSE', 'N', 'NO')
+
+
+def to_bool(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, basestring) and value.upper() in FALSE_STRINGS:
+        return False
+    return bool(value)
+
+
+URL_QUERY_ARGUMENT_PARSERS = {
+    'socket_timeout': float,
+    'socket_connect_timeout': float,
+    'socket_keepalive': to_bool,
+    'retry_on_timeout': to_bool
+}
+
+
 class ConnectionPool(object):
     "Generic connection pool"
     @classmethod
-    def from_url(cls, url, db=None, **kwargs):
+    def from_url(cls, url, db=None, decode_components=False, **kwargs):
         """
         Return a connection pool configured from the given URL.
 
@@ -752,9 +781,20 @@ class ConnectionPool(object):
 
         If none of these options are specified, db=0 is used.
 
+        The ``decode_components`` argument allows this function to work with
+        percent-encoded URLs. If this argument is set to ``True`` all ``%xx``
+        escapes will be replaced by their single-character equivalents after
+        the URL has been parsed. This only applies to the ``hostname``,
+        ``path``, and ``password`` components.
+
         Any additional querystring arguments and keyword arguments will be
-        passed along to the ConnectionPool class's initializer. In the case
-        of conflicting arguments, querystring arguments always win.
+        passed along to the ConnectionPool class's initializer. The querystring
+        arguments ``socket_connect_timeout`` and ``socket_timeout`` if supplied
+        are parsed as float values. The arguments ``socket_keepalive`` and
+        ``retry_on_timeout`` are parsed to boolean values that accept
+        True/False, Yes/No values to indicate state. Invalid types cause a
+        ``UserWarning`` to be raised. In the case of conflicting arguments,
+        querystring arguments always win.
         """
         url_string = url
         url = urlparse(url)
@@ -774,28 +814,46 @@ class ConnectionPool(object):
 
         for name, value in iteritems(parse_qs(qs)):
             if value and len(value) > 0:
-                url_options[name] = value[0]
+                parser = URL_QUERY_ARGUMENT_PARSERS.get(name)
+                if parser:
+                    try:
+                        url_options[name] = parser(value[0])
+                    except (TypeError, ValueError):
+                        warnings.warn(UserWarning(
+                            "Invalid value for `%s` in connection URL." % name
+                        ))
+                else:
+                    url_options[name] = value[0]
+
+        if decode_components:
+            password = unquote(url.password) if url.password else None
+            path = unquote(url.path) if url.path else None
+            hostname = unquote(url.hostname) if url.hostname else None
+        else:
+            password = url.password
+            path = url.path
+            hostname = url.hostname
 
         # We only support redis:// and unix:// schemes.
         if url.scheme == 'unix':
             url_options.update({
-                'password': url.password,
-                'path': url.path,
+                'password': password,
+                'path': path,
                 'connection_class': UnixDomainSocketConnection,
             })
 
         else:
             url_options.update({
-                'host': url.hostname,
+                'host': hostname,
                 'port': int(url.port or 6379),
-                'password': url.password,
+                'password': password,
             })
 
             # If there's a path argument, use it as the db argument if a
             # querystring value wasn't specified
-            if 'db' not in url_options and url.path:
+            if 'db' not in url_options and path:
                 try:
-                    url_options['db'] = int(url.path.replace('/', ''))
+                    url_options['db'] = int(path.replace('/', ''))
                 except (AttributeError, ValueError):
                     pass
 

@@ -3,10 +3,12 @@ from itertools import chain
 import datetime
 import sys
 import warnings
+import time
 import threading
 import time as mod_time
 from redis._compat import (b, basestring, bytes, imap, iteritems, iterkeys,
-                           itervalues, izip, long, nativestr, unicode)
+                           itervalues, izip, long, nativestr, unicode,
+                           safe_unicode)
 from redis.connection import (ConnectionPool, UnixDomainSocketConnection,
                               SSLConnection, Token)
 from redis.lock import Lock, LuaLock
@@ -57,7 +59,8 @@ def string_keys_to_dict(key_string, callback):
 
 def dict_merge(*dicts):
     merged = {}
-    [merged.update(d) for d in dicts]
+    for d in dicts:
+        merged.update(d)
     return merged
 
 
@@ -276,6 +279,35 @@ def parse_slowlog_get(response, **options):
     } for item in response]
 
 
+def parse_cluster_info(response, **options):
+    return dict([line.split(':') for line in response.splitlines() if line])
+
+
+def _parse_node_line(line):
+    line_items = line.split(' ')
+    node_id, addr, flags, master_id, ping, pong, epoch, \
+        connected = line.split(' ')[:8]
+    slots = [sl.split('-') for sl in line_items[8:]]
+    node_dict = {
+        'node_id': node_id,
+        'flags': flags,
+        'master_id': master_id,
+        'last_ping_sent': ping,
+        'last_pong_rcvd': pong,
+        'epoch': epoch,
+        'slots': slots,
+        'connected': True if connected == 'connected' else False
+    }
+    return addr, node_dict
+
+
+def parse_cluster_nodes(response, **options):
+    raw_lines = response
+    if isinstance(response, basestring):
+        raw_lines = response.splitlines()
+    return dict([_parse_node_line(line) for line in raw_lines])
+
+
 class StrictRedis(object):
     """
     Implementation of the Redis protocol.
@@ -358,7 +390,23 @@ class StrictRedis(object):
             'SLOWLOG RESET': bool_ok,
             'SSCAN': parse_scan,
             'TIME': lambda x: (int(x[0]), int(x[1])),
-            'ZSCAN': parse_zscan
+            'ZSCAN': parse_zscan,
+            'CLUSTER ADDSLOTS': bool_ok,
+            'CLUSTER COUNT-FAILURE-REPORTS': lambda x: int(x),
+            'CLUSTER COUNTKEYSINSLOT': lambda x: int(x),
+            'CLUSTER DELSLOTS': bool_ok,
+            'CLUSTER FAILOVER': bool_ok,
+            'CLUSTER FORGET': bool_ok,
+            'CLUSTER INFO': parse_cluster_info,
+            'CLUSTER KEYSLOT': lambda x: int(x),
+            'CLUSTER MEET': bool_ok,
+            'CLUSTER NODES': parse_cluster_nodes,
+            'CLUSTER REPLICATE': bool_ok,
+            'CLUSTER RESET': bool_ok,
+            'CLUSTER SAVECONFIG': bool_ok,
+            'CLUSTER SET-CONFIG-EPOCH': bool_ok,
+            'CLUSTER SETSLOT': bool_ok,
+            'CLUSTER SLAVES': parse_cluster_nodes
         }
     )
 
@@ -397,7 +445,8 @@ class StrictRedis(object):
                  charset=None, errors=None,
                  decode_responses=False, retry_on_timeout=False,
                  ssl=False, ssl_keyfile=None, ssl_certfile=None,
-                 ssl_cert_reqs=None, ssl_ca_certs=None):
+                 ssl_cert_reqs=None, ssl_ca_certs=None,
+                 max_connections=None):
         if not connection_pool:
             if charset is not None:
                 warnings.warn(DeprecationWarning(
@@ -415,7 +464,8 @@ class StrictRedis(object):
                 'encoding': encoding,
                 'encoding_errors': encoding_errors,
                 'decode_responses': decode_responses,
-                'retry_on_timeout': retry_on_timeout
+                'retry_on_timeout': retry_on_timeout,
+                'max_connections': max_connections
             }
             # based on input, setup appropriate connection args
             if unix_socket_path is not None:
@@ -476,6 +526,7 @@ class StrictRedis(object):
         """
         shard_hint = kwargs.pop('shard_hint', None)
         value_from_callable = kwargs.pop('value_from_callable', False)
+        watch_delay = kwargs.pop('watch_delay', None)
         with self.pipeline(True, shard_hint) as pipe:
             while 1:
                 try:
@@ -485,6 +536,8 @@ class StrictRedis(object):
                     exec_value = pipe.execute()
                     return func_value if value_from_callable else exec_value
                 except WatchError:
+                    if watch_delay is not None and watch_delay > 0:
+                        time.sleep(watch_delay)
                     continue
 
     def lock(self, name, timeout=None, sleep=0.1, blocking_timeout=None,
@@ -762,6 +815,15 @@ class StrictRedis(object):
         """
         return self.execute_command('TIME')
 
+    def wait(self, num_replicas, timeout):
+        """
+        Redis synchronous replication
+        That returns the number of replicas that processed the query when
+        we finally have at least ``num_replicas``, or when the ``timeout`` was
+        reached.
+        """
+        return self.execute_command('WAIT', num_replicas, timeout)
+
     # BASIC KEY COMMANDS
     def append(self, key, value):
         """
@@ -868,7 +930,7 @@ class StrictRedis(object):
         doesn't exist.
         """
         value = self.get(name)
-        if value:
+        if value is not None:
             return value
         raise KeyError(name)
 
@@ -1646,6 +1708,22 @@ class StrictRedis(object):
             pieces.extend([Token('LIMIT'), start, num])
         return self.execute_command(*pieces)
 
+    def zrevrangebylex(self, name, max, min, start=None, num=None):
+        """
+        Return the reversed lexicographical range of values from sorted set
+        ``name`` between ``max`` and ``min``.
+
+        If ``start`` and ``num`` are specified, then return a slice of the
+        range.
+        """
+        if (start is not None and num is None) or \
+                (num is not None and start is None):
+            raise RedisError("``start`` and ``num`` must both be specified")
+        pieces = ['ZREVRANGEBYLEX', name, max, min]
+        if start is not None and num is not None:
+            pieces.extend([Token('LIMIT'), start, num])
+        return self.execute_command(*pieces)
+
     def zrangebyscore(self, name, min, max, start=None, num=None,
                       withscores=False, score_cast_func=float):
         """
@@ -1799,12 +1877,12 @@ class StrictRedis(object):
         "Adds the specified elements to the specified HyperLogLog."
         return self.execute_command('PFADD', name, *values)
 
-    def pfcount(self, name):
+    def pfcount(self, *sources):
         """
         Return the approximated cardinality of
-        the set observed by the HyperLogLog at key.
+        the set observed by the HyperLogLog at key(s).
         """
-        return self.execute_command('PFCOUNT', name)
+        return self.execute_command('PFCOUNT', *sources)
 
     def pfmerge(self, dest, *sources):
         "Merge N different HyperLogLogs into a single one."
@@ -1886,6 +1964,9 @@ class StrictRedis(object):
         Returns the number of subscribers the message was delivered to.
         """
         return self.execute_command('PUBLISH', channel, message)
+
+    def cluster(self, cluster_arg, *args):
+        return self.execute_command('CLUSTER %s' % cluster_arg.upper(), *args)
 
     def eval(self, script, numkeys, *keys_and_args):
         """
@@ -2112,8 +2193,8 @@ class PubSub(object):
     def execute_command(self, *args, **kwargs):
         "Execute a publish/subscribe command"
 
-        # NOTE: don't parse the response in this function. it could pull a
-        # legitmate message off the stack if the connection is already
+        # NOTE: don't parse the response in this function -- it could pull a
+        # legitimate message off the stack if the connection is already
         # subscribed to one or more channels
 
         if self.connection is None:
@@ -2142,10 +2223,10 @@ class PubSub(object):
             # previously listening to
             return command(*args)
 
-    def parse_response(self, block=True):
+    def parse_response(self, block=True, timeout=0):
         "Parse the response from a publish/subscribe command"
         connection = self.connection
-        if not block and not connection.can_read():
+        if not block and not connection.can_read(timeout=timeout):
             return None
         return self._execute(connection, connection.read_response)
 
@@ -2216,9 +2297,15 @@ class PubSub(object):
             if response is not None:
                 yield response
 
-    def get_message(self, ignore_subscribe_messages=False):
-        "Get the next message if one is available, otherwise None"
-        response = self.parse_response(block=False)
+    def get_message(self, ignore_subscribe_messages=False, timeout=0):
+        """
+        Get the next message if one is available, otherwise None.
+
+        If timeout is specified, the system will wait for `timeout` seconds
+        before returning. Timeout should be specified as a floating point
+        number.
+        """
+        response = self.parse_response(block=False, timeout=timeout)
         if response:
             return self.handle_message(response, ignore_subscribe_messages)
         return None
@@ -2282,28 +2369,37 @@ class PubSub(object):
         for pattern, handler in iteritems(self.patterns):
             if handler is None:
                 raise PubSubError("Pattern: '%s' has no handler registered")
-        pubsub = self
 
-        class WorkerThread(threading.Thread):
-            def __init__(self, *args, **kwargs):
-                super(WorkerThread, self).__init__(*args, **kwargs)
-                self._running = False
-
-            def run(self):
-                if self._running:
-                    return
-                self._running = True
-                while self._running and pubsub.subscribed:
-                    pubsub.get_message(ignore_subscribe_messages=True)
-                    mod_time.sleep(sleep_time)
-
-            def stop(self):
-                self._running = False
-                self.join()
-
-        thread = WorkerThread()
+        thread = PubSubWorkerThread(self, sleep_time)
         thread.start()
         return thread
+
+
+class PubSubWorkerThread(threading.Thread):
+    def __init__(self, pubsub, sleep_time):
+        super(PubSubWorkerThread, self).__init__()
+        self.pubsub = pubsub
+        self.sleep_time = sleep_time
+        self._running = False
+
+    def run(self):
+        if self._running:
+            return
+        self._running = True
+        pubsub = self.pubsub
+        sleep_time = self.sleep_time
+        while pubsub.subscribed:
+            pubsub.get_message(ignore_subscribe_messages=True,
+                               timeout=sleep_time)
+        pubsub.close()
+        self._running = False
+
+    def stop(self):
+        # stopping simply unsubscribes from all channels and patterns.
+        # the unsubscribe responses that are generated will short circuit
+        # the loop in run(), calling pubsub.close() to clean up the connection
+        self.pubsub.unsubscribe()
+        self.pubsub.punsubscribe()
 
 
 class BasePipeline(object):
@@ -2526,9 +2622,9 @@ class BasePipeline(object):
                 raise r
 
     def annotate_exception(self, exception, number, command):
-        cmd = unicode(' ').join(imap(unicode, command))
+        cmd = safe_unicode(' ').join(imap(safe_unicode, command))
         msg = unicode('Command # %d (%s) of pipeline caused error: %s') % (
-            number, cmd, unicode(exception.args[0]))
+            number, cmd, safe_unicode(exception.args[0]))
         exception.args = (msg,) + exception.args[1:]
 
     def parse_response(self, connection, command_name, **options):
